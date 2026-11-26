@@ -1,0 +1,268 @@
+name: RDP Windows (Tailscale + persistance)
+
+on:
+  workflow_dispatch:
+    inputs:
+      workspace:
+        description: "Nom du workspace sauvegardé (un nom = une sauvegarde)"
+        type: string
+        default: "default"
+      restore:
+        description: "Restaurer le workspace sauvegardé"
+        type: boolean
+        default: true
+      idle_minutes:
+        description: "Arrêt auto après N min sans connexion RDP (0 = jamais)"
+        type: string
+        default: "60"
+      auto_restart:
+        description: "Relancer à la fin des 6 h (max 3 enchaînements)"
+        type: boolean
+        default: false
+      chain:
+        description: "(interne) compteur d'enchaînements, laisser 0"
+        type: string
+        default: "0"
+
+permissions:
+  contents: write   # sauvegarde dans une Release
+  actions: write    # relance automatique
+
+# Une seule session par workspace
+concurrency:
+  group: rdp-${{ inputs.workspace }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  rdp:
+    runs-on: windows-2022
+    timeout-minutes: 360
+    env:
+      RDP_PASSWORD:      ${{ secrets.RDP_PASSWORD }}
+      BACKUP_PASSPHRASE: ${{ secrets.BACKUP_PASSPHRASE }}
+      GH_TOKEN:          ${{ github.token }}
+      WORKSPACE:         ${{ inputs.workspace }}
+      IDLE_MINUTES:      ${{ inputs.idle_minutes }}
+      RUN_MINUTES:       "330"   # ~30 min réservées à la sauvegarde finale
+      BACKUP_EVERY_MIN:  "30"
+    steps:
+      # ------------------------------------------------------------------
+      - name: Vérifier les secrets
+        run: |
+          $pw = $env:RDP_PASSWORD
+          if (-not $pw) { throw "Secret RDP_PASSWORD manquant." }
+          if ($pw.Length -lt 12) { throw "RDP_PASSWORD : 12 caractères minimum." }
+          $classes = @($pw -cmatch '[a-z]', $pw -cmatch '[A-Z]', $pw -match '\d', $pw -match '[^A-Za-z0-9]') | Where-Object { $_ }
+          if ($classes.Count -lt 3) { throw "RDP_PASSWORD : 3 types de caractères minimum (maj, min, chiffres, symboles)." }
+          if (-not "${{ secrets.TAILSCALE_AUTHKEY }}") { throw "Secret TAILSCALE_AUTHKEY manquant." }
+          Write-Host "::add-mask::$pw"
+
+      # ------------------------------------------------------------------
+      - name: Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: gh-rdp-${{ inputs.workspace }}
+
+      # ------------------------------------------------------------------
+      - name: Fonctions de sauvegarde / restauration
+        run: |
+          @'
+          $ErrorActionPreference = 'Continue'
+          $R        = $env:GITHUB_REPOSITORY
+          $WS       = ($env:WORKSPACE -replace '[^A-Za-z0-9_-]', '-')
+          $Tag      = "ws-$WS-windows"
+          $Tmp      = $env:RUNNER_TEMP
+          $Work     = 'C:\workspace'
+          $Baseline = Join-Path $Tmp 'baseline-packages.txt'
+          $Marker   = Join-Path $Tmp 'final_backup_done'
+          $7z       = 'C:\Program Files\7-Zip\7z.exe'
+          $Home_    = $env:USERPROFILE
+          $Paths    = @($Work) + @('Desktop','Documents','Downloads','Pictures','.ssh','AppData\Roaming' | ForEach-Object { Join-Path $Home_ $_ })
+
+          function Get-Pass { if ($env:BACKUP_PASSPHRASE) { $env:BACKUP_PASSPHRASE } else { $env:RDP_PASSWORD } }
+          function Get-Choco { choco list -r 2>$null | ForEach-Object { ($_ -split '\|')[0].Trim() } | Where-Object { $_ } | Sort-Object }
+
+          function Backup-Workspace([string]$Reason) {
+            Write-Host "Sauvegarde ($Reason)..."
+            $t0 = Get-Date
+            try {
+              New-Item -ItemType Directory -Force "$Work\.state" | Out-Null
+              $base = Get-Content $Baseline -ErrorAction SilentlyContinue
+              Get-Choco | Where-Object { $_ -notin $base } | Set-Content "$Work\.state\extra-packages.txt"
+
+              Get-ChildItem $Tmp -Filter 'workspace-windows.7z*' -ErrorAction SilentlyContinue | Remove-Item -Force
+              $rel = @($Paths | Where-Object { Test-Path $_ } | ForEach-Object { $_.Substring(3) })
+              if ($rel.Count -eq 0) { Write-Host "Rien à sauvegarder."; return $false }
+
+              $out = Join-Path $Tmp 'workspace-windows.7z'
+              Push-Location 'C:\'
+              & $7z a -t7z -mx=3 -mhe=on -v1800m -ssw -bd -y "-p$(Get-Pass)" $out @rel '-xr!Cache' '-xr!Temp' '-xr!Code Cache' '-xr!GPUCache' | Out-Null
+              $code = $LASTEXITCODE
+              Pop-Location
+              if ($code -gt 1) { Write-Host "Archive échouée (7z code $code)"; return $false }
+
+              $files = @(Get-ChildItem $Tmp -Filter 'workspace-windows.7z*')
+              $names = $files.Name
+              gh release view $Tag -R $R 2>&1 | Out-Null
+              if ($LASTEXITCODE -ne 0) {
+                gh release create $Tag -R $R --title "Workspace $WS (windows)" --notes "Sauvegarde chiffrée. Ne pas supprimer." --prerelease | Out-Null
+                if ($LASTEXITCODE -ne 0) { Write-Host "Création de la Release impossible"; return $false }
+              }
+              gh release upload $Tag @($files.FullName) -R $R --clobber | Out-Null
+              if ($LASTEXITCODE -ne 0) { Write-Host "Envoi impossible"; return $false }
+              # Anciennes parties supprimées SEULEMENT après un envoi réussi
+              gh release view $Tag -R $R --json assets -q '.assets[].name' | ForEach-Object {
+                if ($_ -and $_ -notin $names) { gh release delete-asset $Tag $_ -R $R -y | Out-Null }
+              }
+              $mb = [int](($files | Measure-Object Length -Sum).Sum / 1MB)
+              Write-Host ("Sauvegarde OK : {0} Mo en {1} s" -f $mb, [int]((Get-Date) - $t0).TotalSeconds)
+              return $true
+            } catch {
+              Write-Host "Sauvegarde échouée : $($_.Exception.GetType().Name)"
+              return $false
+            } finally {
+              Get-ChildItem $Tmp -Filter 'workspace-windows.7z*' -ErrorAction SilentlyContinue | Remove-Item -Force
+            }
+          }
+
+          function Restore-Workspace {
+            gh release view $Tag -R $R 2>&1 | Out-Null
+            if ($LASTEXITCODE -ne 0) { Write-Host "Aucune sauvegarde : première session pour ce workspace."; return $false }
+            Write-Host "Restauration du workspace..."
+            $d = Join-Path $Tmp 'ws-restore'
+            Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory $d | Out-Null
+            gh release download $Tag -R $R -D $d --clobber | Out-Null
+            $first = Get-ChildItem $d -Filter 'workspace-windows.7z.001' | Select-Object -First 1
+            if (-not $first) { Write-Host "Téléchargement impossible"; return $false }
+            & $7z x -y "-p$(Get-Pass)" '-oC:\' $first.FullName | Out-Null
+            $code = $LASTEXITCODE
+            Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
+            if ($code -gt 1) { Write-Host "Restauration échouée (mauvaise passphrase ?)"; return $false }
+            $extra = Get-Content "$Work\.state\extra-packages.txt" -ErrorAction SilentlyContinue | Where-Object { $_ }
+            if ($extra) {
+              Write-Host "Réinstallation de $($extra.Count) paquet(s) choco..."
+              choco install -y --no-progress @extra | Out-Null
+            }
+            Write-Host "Workspace restauré."
+            return $true
+          }
+          '@ | Set-Content -Path "$env:RUNNER_TEMP\lib.ps1" -Encoding UTF8
+          New-Item -ItemType Directory -Force 'C:\workspace' | Out-Null
+          . "$env:RUNNER_TEMP\lib.ps1"
+          Get-Choco | Set-Content $Baseline
+
+      # ------------------------------------------------------------------
+      - name: Restaurer le workspace
+        if: ${{ inputs.restore }}
+        run: |
+          . "$env:RUNNER_TEMP\lib.ps1"
+          Restore-Workspace | Out-Null
+
+      # ------------------------------------------------------------------
+      - name: Configurer RDP (accessible uniquement via Tailscale)
+        run: |
+          # Compte runneradmin : mot de passe depuis le secret
+          net user runneradmin $env:RDP_PASSWORD | Out-Null
+          net localgroup "Remote Desktop Users" runneradmin /add 2>$null | Out-Null
+
+          # RDP actif, NLA ACTIVÉ
+          $ts = 'HKLM:\System\CurrentControlSet\Control\Terminal Server'
+          Set-ItemProperty $ts -Name fDenyTSConnections -Value 0
+          Set-ItemProperty "$ts\WinStations\RDP-Tcp" -Name UserAuthentication -Value 1
+
+          # Pare-feu : seulement le réseau Tailscale (100.64.0.0/10 + IPv6 Tailscale)
+          Disable-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue
+          Remove-NetFirewallRule -DisplayName 'RDP-Tailscale-only' -ErrorAction SilentlyContinue
+          New-NetFirewallRule -DisplayName 'RDP-Tailscale-only' -Direction Inbound -Protocol TCP `
+            -LocalPort 3389 -RemoteAddress '100.64.0.0/10','fd7a:115c:a1e0::/48' -Action Allow | Out-Null
+
+          powercfg /change standby-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+          Set-Service TermService -StartupType Automatic
+          Restart-Service TermService -Force
+
+      # ------------------------------------------------------------------
+      - name: Afficher l'adresse de connexion
+        run: |
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          $ip = (& $tsExe ip -4 | Select-Object -First 1)
+          $host_ = "gh-rdp-$($env:WORKSPACE -replace '[^A-Za-z0-9_-]', '-')"
+          $msg = @"
+          ### 🖥️ RDP prêt
+          - Adresse : ``$ip`` (ou ``$host_`` avec MagicDNS)
+          - Utilisateur : ``runneradmin``
+          - Mot de passe : secret ``RDP_PASSWORD``
+          - Dossier persistant : ``C:\workspace``
+          - Arrêt auto après $($env:IDLE_MINUTES) min sans connexion
+          "@
+          $msg | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          Write-Host "Connectez-vous à $ip (utilisateur runneradmin)"
+
+      # ------------------------------------------------------------------
+      - name: Garder en vie, surveiller, sauvegarder
+        id: keep
+        run: |
+          . "$env:RUNNER_TEMP\lib.ps1"
+          Remove-Item $Marker -ErrorAction SilentlyContinue
+          $start        = Get-Date
+          $deadline     = $start.AddMinutes([int]$env:RUN_MINUTES)
+          $idleMax      = [int]$env:IDLE_MINUTES
+          $backupEvery  = [int]$env:BACKUP_EVERY_MIN
+          $lastActivity = $start
+          $lastBackup   = $start
+          $nextBeat     = $start.AddMinutes((Get-Random -Minimum 3 -Maximum 8))
+          $nextBackup   = $start.AddMinutes($backupEvery * (Get-Random -Minimum 0.7 -Maximum 1.3))
+          $reason       = 'deadline'
+
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds (Get-Random -Minimum 10 -Maximum 21)
+            $now = Get-Date
+            $n = @(Get-NetTCPConnection -LocalPort 3389 -State Established -ErrorAction SilentlyContinue).Count
+            if ($n -gt 0) { $lastActivity = $now }
+
+            if ($idleMax -gt 0 -and $n -eq 0 -and ($now - $lastActivity).TotalMinutes -ge $idleMax) {
+              $reason = 'idle'; break
+            }
+            if ($backupEvery -gt 0 -and $now -ge $nextBackup) {
+              if ($lastActivity -gt $lastBackup) { Backup-Workspace 'périodique' | Out-Null }
+              $lastBackup = Get-Date
+              $nextBackup = $lastBackup.AddMinutes($backupEvery * (Get-Random -Minimum 0.7 -Maximum 1.3))
+            }
+            if ($now -ge $nextBeat) {
+              Write-Host ("[{0:HH:mm:ss} UTC] en ligne {1} min | connexions RDP : {2}" -f $now.ToUniversalTime(), [int]($now - $start).TotalMinutes, $n)
+              $nextBeat = $now.AddMinutes((Get-Random -Minimum 3 -Maximum 8))
+            }
+          }
+
+          Write-Host "Arrêt : $reason"
+          Backup-Workspace 'finale' | Out-Null
+          Set-Content $Marker 'ok'
+          if ($reason -eq 'deadline') { "restart=true" >> $env:GITHUB_OUTPUT }
+
+      # ------------------------------------------------------------------
+      # S'exécute aussi si le run est annulé
+      - name: Sauvegarde finale (secours)
+        if: always()
+        run: |
+          if (-not (Test-Path "$env:RUNNER_TEMP\lib.ps1")) { exit 0 }
+          . "$env:RUNNER_TEMP\lib.ps1"
+          if (Test-Path $Marker) { Write-Host "Sauvegarde finale déjà effectuée."; exit 0 }
+          Backup-Workspace 'finale (annulation)' | Out-Null
+
+      # ------------------------------------------------------------------
+      - name: Relancer un nouveau serveur
+        if: ${{ success() && inputs.auto_restart && steps.keep.outputs.restart == 'true' && fromJSON(inputs.chain) < 3 }}
+        shell: bash
+        run: |
+          gh workflow run main.yml --repo "${{ github.repository }}" \
+            -f workspace="${{ inputs.workspace }}" \
+            -f restore=true \
+            -f idle_minutes="${{ inputs.idle_minutes }}" \
+            -f auto_restart=true \
+            -f chain=$(( ${{ inputs.chain }} + 1 ))
