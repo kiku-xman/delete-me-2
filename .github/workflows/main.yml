@@ -56,8 +56,12 @@ jobs:
           $pw = $env:RDP_PASSWORD
           if (-not $pw) { throw "Secret RDP_PASSWORD manquant." }
           if ($pw.Length -lt 12) { throw "RDP_PASSWORD : 12 caractères minimum." }
-          $classes = @($pw -cmatch '[a-z]', $pw -cmatch '[A-Z]', $pw -match '\d', $pw -match '[^A-Za-z0-9]') | Where-Object { $_ }
-          if ($classes.Count -lt 3) { throw "RDP_PASSWORD : 3 types de caractères minimum (maj, min, chiffres, symboles)." }
+          $classes = 0
+          if ($pw -cmatch '[a-z]')     { $classes++ }
+          if ($pw -cmatch '[A-Z]')     { $classes++ }
+          if ($pw -match '\d')         { $classes++ }
+          if ($pw -match '[^A-Za-z0-9]') { $classes++ }
+          if ($classes -lt 3) { throw "RDP_PASSWORD : 3 types de caractères minimum (maj, min, chiffres, symboles)." }
           if (-not "${{ secrets.TAILSCALE_AUTHKEY }}") { throw "Secret TAILSCALE_AUTHKEY manquant." }
           Write-Host "::add-mask::$pw"
 
