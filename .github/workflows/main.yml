@@ -305,10 +305,10 @@ jobs:
           $backupEvery  = [int]$env:BACKUP_EVERY_MIN
           $lastActivity = $start
           $lastBackup   = $start
-          Write-Host ("[{0:HH:mm:ss} UTC] Session démarrée. Arrêt prévu à {1:HH:mm:ss} UTC (idle : {2} min, sauvegarde toutes les {3} min)" -f $start.ToUniversalTime(), $deadline.ToUniversalTime(), $idleMax, $backupEvery)
-          $nextBeat     = $start.AddMinutes(1)
           $nextBackup   = $start.AddMinutes($backupEvery * (Get-Random -Minimum 0.7 -Maximum 1.3))
           $reason       = 'deadline'
+
+          Write-Host ("Session démarrée à {0:HH:mm} UTC, fin prévue à {1:HH:mm} UTC." -f $start.ToUniversalTime(), $deadline.ToUniversalTime())
 
           while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds (Get-Random -Minimum 10 -Maximum 21)
@@ -324,13 +324,12 @@ jobs:
               $lastBackup = Get-Date
               $nextBackup = $lastBackup.AddMinutes($backupEvery * (Get-Random -Minimum 0.7 -Maximum 1.3))
             }
-            if ($now -ge $nextBeat) {
-              Write-Host ("[{0:HH:mm:ss} UTC] en ligne {1} min | connexions RDP : {2}" -f $now.ToUniversalTime(), [int]($now - $start).TotalMinutes, $n)
-              $nextBeat = $now.AddMinutes(1)
-            }
           }
 
-          Write-Host "Arrêt : $reason"
+          switch ($reason) {
+            'idle'     { Write-Host "Arrêt : inactivité de $idleMax min." }
+            'deadline' { Write-Host "Arrêt : durée maximale atteinte." }
+          }
           Backup-Workspace 'finale' | Out-Null
           Set-Content $Marker 'ok'
           if ($reason -eq 'deadline') { "restart=true" >> $env:GITHUB_OUTPUT }
