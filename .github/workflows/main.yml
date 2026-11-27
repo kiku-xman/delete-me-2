@@ -54,6 +54,8 @@ jobs:
       BACKUP_ENABLED:    ${{ inputs.backup }}
       RUN_MINUTES:       "330"   # ~30 min réservées à la sauvegarde finale
       BACKUP_EVERY_MIN:  "30"
+      LOG_MIN_SEC:       "60"    # un log toutes les 60 à 120 s (aléatoire)
+      LOG_MAX_SEC:       "120"
     steps:
       # ------------------------------------------------------------------
       - name: Vérifier les secrets
@@ -316,16 +318,69 @@ jobs:
           $idleMax      = [int]$env:IDLE_MINUTES
           $backupOn     = ($env:BACKUP_ENABLED -eq 'true')
           $backupEvery  = if ($backupOn) { [int]$env:BACKUP_EVERY_MIN } else { 0 }
+          $logMin       = [int]$env:LOG_MIN_SEC
+          $logMax       = [int]$env:LOG_MAX_SEC
           $lastActivity = $start
           $lastBackup   = $start
           $nextBackup   = $start.AddMinutes([Math]::Max($backupEvery, 1) * (Get-Random -Minimum 0.7 -Maximum 1.3))
+          $lastBackupInfo = 'aucune pour le moment'
+          $beat         = 0
           $reason       = 'deadline'
+
+          # --- Log de statut : infos système réelles ---
+          function Write-Heartbeat {
+            $script:beat++
+            try {
+              $now = Get-Date
+              $el  = $now - $start
+              $rem = $deadline - $now
+              if ($rem.TotalSeconds -lt 0) { $rem = [TimeSpan]::Zero }
+
+              $cpu = [int](Get-CimInstance Win32_Processor | Measure-Object LoadPercentage -Average).Average
+              $os  = Get-CimInstance Win32_OperatingSystem
+              $totGB  = $os.TotalVisibleMemorySize / 1MB
+              $usedGB = ($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB
+              $ramPct = [int](100 * $usedGB / $totGB)
+              $disk   = Get-PSDrive C
+              $freeGB = $disk.Free / 1GB
+              $procs  = @(Get-Process)
+              $top    = $procs | Sort-Object WorkingSet64 -Descending | Select-Object -First 1
+
+              if (-not $backupOn) {
+                $bk = 'sauvegarde désactivée'
+              } else {
+                $mins = [Math]::Max(0, [int][Math]::Ceiling(($nextBackup - $now).TotalMinutes))
+                $bk = "prochaine sauvegarde dans ~$mins min (dernière : $lastBackupInfo)"
+              }
+
+              Write-Host ('[{0:HH:mm:ss} UTC] #{1} | écoulé {2:hh\:mm\:ss} | reste {3:hh\:mm\:ss} | CPU {4}% | RAM {5:N1}/{6:N1} Go ({7}%) | Disque C: {8:N1} Go libres | {9} processus | top RAM : {10} ({11:N0} Mo) | {12}' -f `
+                $now.ToUniversalTime(), $script:beat, $el, $rem, $cpu, $usedGB, $totGB, $ramPct, $freeGB, $procs.Count, $top.ProcessName, ($top.WorkingSet64 / 1MB), $bk)
+
+              # Ligne de détail toutes les 5 lignes
+              if ($script:beat % 5 -eq 0) {
+                $wsMB = 0
+                try {
+                  $wsMB = (Get-ChildItem 'C:\workspace' -Recurse -Force -File -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum / 1MB
+                } catch {}
+                $top3 = ($procs | Sort-Object WorkingSet64 -Descending | Select-Object -First 3 |
+                  ForEach-Object { '{0} {1:N0} Mo' -f $_.ProcessName, ($_.WorkingSet64 / 1MB) }) -join ', '
+                $up = $now - $os.LastBootUpTime
+                Write-Host ('           ↳ détail : C:\workspace = {0:N0} Mo | top 3 RAM : {1} | machine allumée depuis {2:hh\:mm\:ss}' -f $wsMB, $top3, $up)
+              }
+            } catch {
+              Write-Host ("[{0:HH:mm:ss} UTC] #{1} | session active (statut détaillé indisponible)" -f (Get-Date).ToUniversalTime(), $script:beat)
+            }
+          }
 
           Write-Host ("Session démarrée à {0:HH:mm} UTC, fin prévue à {1:HH:mm} UTC." -f $start.ToUniversalTime(), $deadline.ToUniversalTime())
           if (-not $backupOn) { Write-Host "Sauvegarde désactivée : aucune sauvegarde ne sera effectuée." }
+          Write-Host ("Un log de statut sera affiché toutes les {0} à {1} secondes (intervalle aléatoire)." -f $logMin, $logMax)
+
+          Write-Heartbeat
+          $nextLog = (Get-Date).AddSeconds((Get-Random -Minimum $logMin -Maximum ($logMax + 1)))
 
           while ((Get-Date) -lt $deadline) {
-            Start-Sleep -Seconds (Get-Random -Minimum 10 -Maximum 21)
+            Start-Sleep -Seconds (Get-Random -Minimum 3 -Maximum 9)
             $now = Get-Date
             $n = @(Get-NetTCPConnection -LocalPort 3389 -State Established -ErrorAction SilentlyContinue).Count
             if ($n -gt 0) { $lastActivity = $now }
@@ -333,10 +388,22 @@ jobs:
             if ($idleMax -gt 0 -and $n -eq 0 -and ($now - $lastActivity).TotalMinutes -ge $idleMax) {
               $reason = 'idle'; break
             }
+
             if ($backupEvery -gt 0 -and $now -ge $nextBackup) {
-              if ($lastActivity -gt $lastBackup) { Backup-Workspace 'périodique' | Out-Null }
+              if ($lastActivity -gt $lastBackup) {
+                $res = @(Backup-Workspace 'périodique')
+                $okb = ($res.Count -gt 0 -and $res[-1] -eq $true)
+                $lastBackupInfo = ('{0:HH:mm} UTC {1}' -f (Get-Date).ToUniversalTime(), $(if ($okb) { 'OK' } else { 'ÉCHEC' }))
+              } else {
+                Write-Host "Sauvegarde périodique ignorée : aucun changement depuis la dernière."
+              }
               $lastBackup = Get-Date
               $nextBackup = $lastBackup.AddMinutes($backupEvery * (Get-Random -Minimum 0.7 -Maximum 1.3))
+            }
+
+            if ($now -ge $nextLog) {
+              Write-Heartbeat
+              $nextLog = (Get-Date).AddSeconds((Get-Random -Minimum $logMin -Maximum ($logMax + 1)))
             }
           }
 
