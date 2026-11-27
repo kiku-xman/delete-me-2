@@ -11,6 +11,10 @@ on:
         description: "Restaurer le workspace sauvegardé"
         type: boolean
         default: true
+      backup:
+        description: "Sauvegarder le workspace (périodique + finale)"
+        type: boolean
+        default: true
       idle_minutes:
         description: "Arrêt auto après N min sans connexion RDP (0 = jamais)"
         type: string
@@ -47,6 +51,7 @@ jobs:
       GH_TOKEN:          ${{ github.token }}
       WORKSPACE:         ${{ inputs.workspace }}
       IDLE_MINUTES:      ${{ inputs.idle_minutes }}
+      BACKUP_ENABLED:    ${{ inputs.backup }}
       RUN_MINUTES:       "330"   # ~30 min réservées à la sauvegarde finale
       BACKUP_EVERY_MIN:  "30"
     steps:
@@ -160,6 +165,11 @@ jobs:
           }
 
           function Backup-Workspace([string]$Reason) {
+            # Sauvegarde désactivée depuis les inputs : on ne fait rien
+            if ($env:BACKUP_ENABLED -ne 'true') {
+              Write-Host "Sauvegarde désactivée ($Reason) : ignorée."
+              return $false
+            }
             Write-Host "Sauvegarde ($Reason)..."
             $t0 = Get-Date
             try {
@@ -281,12 +291,14 @@ jobs:
           $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
           $ip = (& $tsExe ip -4 | Select-Object -First 1)
           $host_ = "gh-rdp-$($env:WORKSPACE -replace '[^A-Za-z0-9_-]', '-')"
+          $bk = if ($env:BACKUP_ENABLED -eq 'true') { 'activée' } else { 'DÉSACTIVÉE (rien ne sera conservé)' }
           $msg = @"
           ### 🖥️ RDP prêt
           - Adresse : ``$ip`` (ou ``$host_`` avec MagicDNS)
           - Utilisateur : ``runneradmin``
           - Mot de passe : secret ``RDP_PASSWORD``
           - Dossier persistant : ``C:\workspace``
+          - Sauvegarde : $bk
           - Arrêt auto après $($env:IDLE_MINUTES) min sans connexion
           "@
           $msg | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
@@ -302,13 +314,15 @@ jobs:
           $start        = Get-Date
           $deadline     = $start.AddMinutes([int]$env:RUN_MINUTES)
           $idleMax      = [int]$env:IDLE_MINUTES
-          $backupEvery  = [int]$env:BACKUP_EVERY_MIN
+          $backupOn     = ($env:BACKUP_ENABLED -eq 'true')
+          $backupEvery  = if ($backupOn) { [int]$env:BACKUP_EVERY_MIN } else { 0 }
           $lastActivity = $start
           $lastBackup   = $start
-          $nextBackup   = $start.AddMinutes($backupEvery * (Get-Random -Minimum 0.7 -Maximum 1.3))
+          $nextBackup   = $start.AddMinutes([Math]::Max($backupEvery, 1) * (Get-Random -Minimum 0.7 -Maximum 1.3))
           $reason       = 'deadline'
 
           Write-Host ("Session démarrée à {0:HH:mm} UTC, fin prévue à {1:HH:mm} UTC." -f $start.ToUniversalTime(), $deadline.ToUniversalTime())
+          if (-not $backupOn) { Write-Host "Sauvegarde désactivée : aucune sauvegarde ne sera effectuée." }
 
           while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds (Get-Random -Minimum 10 -Maximum 21)
@@ -354,6 +368,7 @@ jobs:
           gh workflow run "${{ github.workflow }}" --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" \
             -f workspace="${{ inputs.workspace }}" \
             -f restore=true \
+            -f backup="${{ inputs.backup }}" \
             -f idle_minutes="${{ inputs.idle_minutes }}" \
             -f auto_restart=true \
             -f chain=$(( ${{ inputs.chain }} + 1 ))
